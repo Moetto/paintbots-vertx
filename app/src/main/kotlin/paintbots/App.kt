@@ -3,33 +3,82 @@
  */
 package paintbots
 
+import arrow.atomic.Atomic
 import arrow.core.Either
+import arrow.core.flatMap
 import io.vertx.core.Vertx
+import io.vertx.core.buffer.Buffer
 import io.vertx.core.http.HttpServerOptions
+import io.vertx.core.shareddata.Lock
+import io.vertx.core.shareddata.SharedData
 import io.vertx.ext.web.Router
 import io.vertx.ext.web.RoutingContext
 import io.vertx.ext.web.handler.BodyHandler
+import java.awt.Color
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
+import java.io.OutputStream
 import java.util.UUID
+import javax.imageio.ImageIO
 
 class MissingParameterException : Exception()
+
+data class BotColor(
+    val color: Color,
+    val code: Char,
+)
+
+val colors = listOf(
+    BotColor(Color.decode("#902068"), '0'),
+    BotColor(Color.decode("#f81868"), '1'),
+    BotColor(Color.decode("#ffa880"), '2'),
+    BotColor(Color.decode("#ff7000"), '3'),
+    BotColor(Color.decode("#a80010"), '4'),
+    BotColor(Color.decode("#ffa800"), '5'),
+    BotColor(Color.decode("#ffffa8"), '6'),
+    BotColor(Color.decode("#a8e038"), '7'),
+    BotColor(Color.decode("#5800a8"), '8'),
+    BotColor(Color.decode("#6828ff"), '9'),
+    BotColor(Color.decode("#ffffff"), 'a'),
+    BotColor(Color.decode("#e0d0ff"), 'b'),
+    BotColor(Color.decode("#a070c8"), 'c'),
+    BotColor(Color.decode("#683090"), 'd'),
+    BotColor(Color.decode("#481868"), 'e'),
+    BotColor(Color.decode("#000000"), 'f'),
+)
 
 data class Bot(
     val name: String,
     val id: UUID,
+    val x: Int,
+    val y: Int,
+    val color: BotColor = colors.random(),
 )
+
+data class Settings(
+    val width: Int,
+    val height: Int,
+)
+
+val settings = Settings(100, 100)
 
 data class State(
     val bots: List<Bot>,
+    val canvas: BufferedImage,
 )
 
-var state = State(listOf())
+var state = State(
+    listOf(),
+    BufferedImage(settings.width, settings.height, BufferedImage.TYPE_INT_RGB)
+)
 
 fun getFormAttribute(ctx: RoutingContext, attribute: String): Either<MissingParameterException, String> {
     return Either.Right(ctx.request().getFormAttribute(attribute)) ?: Either.Left(MissingParameterException())
 }
 
-fun getId(ctx: RoutingContext): Either<MissingParameterException, String> {
+fun getId(ctx: RoutingContext): Either<MissingParameterException, UUID> {
     return getFormAttribute(ctx, "id")
+        .map(UUID::fromString)
 }
 
 fun register(ctx: RoutingContext) {
@@ -43,7 +92,14 @@ fun register(ctx: RoutingContext) {
                 Pair(409, "Bot with that name already registered")
             } else {
                 val id = UUID.randomUUID()
-                state = state.copy(bots = state.bots + Bot(name, id))
+                state = state.copy(
+                    bots = state.bots + Bot(
+                        name,
+                        id,
+                        (0 until settings.width).random(),
+                        (0 until settings.height).random(),
+                    )
+                )
                 Pair(200, id.toString())
             }
         },
@@ -51,8 +107,26 @@ fun register(ctx: RoutingContext) {
     ctx.response().setStatusCode(responseCode).end(responseBody)
 }
 
+fun setCanvasPixel(x: Int, y: Int, c: Color) {
+    state = state.copy()
+}
+
+fun paint(bot: Bot) {
+    val c = bot.color.color
+    state.canvas.setRGB(c.red, c.green, c.blue)
+}
+
 fun paint(ctx: RoutingContext) {
-    ctx.response().setStatusCode(200).end()
+    getId(ctx)
+        .map { id -> state.bots.first { it.id == id } }
+        .map { Pair(it, ctx.vertx().sharedData().getLock(it.id.toString())) }
+        .map { (bot, f) ->
+            f.onSuccess { lock ->
+                paint(bot)
+                ctx.response().setStatusCode(200).end()
+                lock.release()
+            }
+        }
 }
 
 fun bye(ctx: RoutingContext) {
@@ -76,6 +150,14 @@ fun router(vertx: Vertx): Router {
     router.post("/")
         .handler(BodyHandler.create().setMergeFormAttributes(true))
         .handler(::routeByParam)
+    router.get("/")
+        .handler { ctx ->
+            val os = ByteArrayOutputStream()
+            ImageIO.write(state.canvas, "png", os)
+            ctx.response()
+                .putHeader("Content-type", "image/png")
+                .end(Buffer.buffer(os.toByteArray()))
+        }
     return router
 }
 
