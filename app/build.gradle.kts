@@ -30,8 +30,8 @@ dependencies {
     // Use the JUnit 5 integration.
     testImplementation("org.junit.jupiter:junit-jupiter-engine:5.9.1")
 
-    // This dependency is used by the application.
-    implementation("com.google.guava:guava:31.1-jre")
+    runtimeOnly("io.netty:netty-resolver-dns-native-macos:4.1.92.Final")
+
 }
 
 // Apply a specific Java toolchain to ease working on different environments.

@@ -3,86 +3,279 @@
  */
 package paintbots
 
-import arrow.core.Either
+import arrow.atomic.AtomicBoolean
+import arrow.core.*
 import io.vertx.core.Vertx
+import io.vertx.core.buffer.Buffer
 import io.vertx.core.http.HttpServerOptions
 import io.vertx.ext.web.Router
 import io.vertx.ext.web.RoutingContext
 import io.vertx.ext.web.handler.BodyHandler
-import java.util.UUID
+import io.vertx.ext.web.handler.StaticHandler
+import java.awt.Color
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
+import java.util.*
+import java.util.concurrent.atomic.AtomicReference
+import javax.imageio.ImageIO
+import kotlin.math.max
+import kotlin.math.min
 
-class MissingParameterException : Exception()
+sealed class PaintBotsException : Exception()
+class InvalidParameterException : PaintBotsException()
+class MissingParameterException : PaintBotsException()
+
+class NotRegisteredException : PaintBotsException()
+
+class AlreadyRegisteredException : PaintBotsException()
+
+class UnknownCommandException : PaintBotsException()
+
+typealias BotCommandReturn = Either<PaintBotsException, Pair<State, Bot>>
+
+val colors = mapOf(
+        '0' to Color.decode("#000000"),
+        '1' to Color.decode("#1D2B53"),
+        '2' to Color.decode("#7E2553"),
+        '3' to Color.decode("#008751"),
+        '4' to Color.decode("#AB5236"),
+        '5' to Color.decode("#5F574F"),
+        '6' to Color.decode("#C2C3C7"),
+        '7' to Color.decode("#FFF1E8"),
+        '8' to Color.decode("#FF004D"),
+        '9' to Color.decode("#FFA300"),
+        'a' to Color.decode("#FFEC27"),
+        'b' to Color.decode("#00E436"),
+        'c' to Color.decode("#29ADFF"),
+        'd' to Color.decode("#83769C"),
+        'e' to Color.decode("#FF77A8"),
+        'f' to Color.decode("#FFCCAA"),
+)
 
 data class Bot(
-    val name: String,
-    val id: UUID,
+        val name: String,
+        val id: UUID,
+        val x: Int,
+        val y: Int,
+        val color: Char = colors.keys.random(),
 )
+
+data class Settings(
+        val width: Int,
+        val height: Int,
+)
+
+val settings = Settings(100, 100)
 
 data class State(
-    val bots: List<Bot>,
+        val bots: Map<UUID, Bot>,
+        val canvas: BufferedImage,
 )
 
-var state = State(listOf())
+val state = AtomicReference(State(mapOf(), BufferedImage(settings.width, settings.height, BufferedImage.TYPE_INT_RGB)))
+val vertx: Vertx = Vertx.vertx()
+
+fun <T> swapState(stateFunc: (State) -> Pair<State, T>): T {
+    var result: T
+    do {
+        val oldState = state.get()
+        val (newState, newResult) = stateFunc(oldState)
+        result = newResult
+    } while (!state.compareAndSet(oldState, newState))
+    vertx.eventBus().publish("state", "newState")
+    return result
+}
 
 fun getFormAttribute(ctx: RoutingContext, attribute: String): Either<MissingParameterException, String> {
-    return Either.Right(ctx.request().getFormAttribute(attribute)) ?: Either.Left(MissingParameterException())
+    return ctx.request().getFormAttribute(attribute).right() ?: MissingParameterException().left()
 }
 
-fun getId(ctx: RoutingContext): Either<MissingParameterException, String> {
-    return getFormAttribute(ctx, "id")
+fun getId(ctx: RoutingContext): Either<MissingParameterException, UUID> {
+    return getFormAttribute(ctx, "id").map(UUID::fromString)
 }
 
-fun register(ctx: RoutingContext) {
-    val wantedName = getFormAttribute(ctx, "register")
-    val (responseCode, responseBody) = wantedName.fold(
-        {
-            Pair(400, "Parameter id required")
-        },
-        { name ->
-            if (state.bots.any { name == it.name }) {
-                Pair(409, "Bot with that name already registered")
+fun register(ctx: RoutingContext): Either<PaintBotsException, Pair<State, Bot>> {
+    println("Registering")
+    return getFormAttribute(ctx, "register").map { name ->
+        return swapState { state ->
+            if (state.bots.values.any { name == it.name }) {
+                println("Already registered $name")
+                Pair(state, AlreadyRegisteredException().left())
             } else {
                 val id = UUID.randomUUID()
-                state = state.copy(bots = state.bots + Bot(name, id))
-                Pair(200, id.toString())
+                val bot = Bot(
+                        name,
+                        id,
+                        (0 until settings.width).random(),
+                        (0 until settings.height).random(),
+                )
+                println("New bot $bot")
+                val newState = state.copy(bots = state.bots + (id to bot))
+                Pair(newState, Pair(newState, bot).right())
             }
-        },
-    )
-    ctx.response().setStatusCode(responseCode).end(responseBody)
+        }
+    }
 }
 
-fun paint(ctx: RoutingContext) {
-    ctx.response().setStatusCode(200).end()
+fun setPixel(bot: Bot, paramValue: String, state: State): Either<PaintBotsException, Pair<State, Bot>> {
+    println("Painting in ${bot.color}")
+    state.canvas.setRGB(bot.x, bot.y, colors[bot.color]!!.rgb)
+    return Pair(state, bot).right()
 }
 
-fun bye(ctx: RoutingContext) {
-    ctx.response().setStatusCode(200).end()
+fun botCommand(
+        ctx: RoutingContext,
+        paramValue: String,
+        func: ((Bot, String, State) -> Either<PaintBotsException, Pair<State, Bot>>)
+) {
+    getId(ctx).map { id -> state.get().bots[id] }.flatMap { bot -> bot?.right() ?: NotRegisteredException().left() }
+            .map { Pair(it, ctx.vertx().sharedData().getLock(it.id.toString())) }.map { (bot, f) ->
+                f.onSuccess { lock ->
+                    println("Starting command $func for $bot")
+                    val res = swapState { currentState ->
+                        func.invoke(bot, paramValue, currentState).fold({
+                            Pair(currentState, it.left())
+                        }, {
+                            return@fold Pair(it.first, it.right())
+                        })
+                    }
+                    res.fold({
+                        ctx.response().setStatusCode(400).end()
+                    }, {(_, bot) ->
+                        ctx.response().setStatusCode(200).end("x=${bot.x}&y=${bot.y}&color=${bot.color}")
+                    })
+                    lock.release()
+                }
+            }
 }
 
-val commands = mapOf(
-    "register" to ::register,
-    "paint" to ::paint,
-    "bye" to ::bye,
+fun removeBot(bot: Bot, paramValue: String, state: State): Either<PaintBotsException, Pair<State, Bot>> =
+        Pair(state.copy(bots = state.bots - bot.id), bot).right()
+
+enum class Direction {
+    LEFT, RIGHT, UP, DOWN
+}
+
+fun deregisterBot(bot: Bot, paramValue: String, state: State): Either<PaintBotsException, Pair<State, Bot>> {
+    println("Deregistering $bot")
+    return Pair(state.copy(bots = state.bots - bot.id), bot).right()
+}
+
+fun moveBot(bot: Bot, paramValue: String, state: State): Either<PaintBotsException, Pair<State, Bot>> {
+    val direction =
+            Direction.values().firstOrNull { it.name == paramValue } ?: return InvalidParameterException().left()
+    println("Direction for $paramValue is $direction")
+    val newBot = when (direction) {
+        Direction.LEFT -> bot.copy(x = max(bot.x - 1, 0))
+        Direction.RIGHT -> bot.copy(x = min(bot.x + 1, settings.width - 1))
+        Direction.UP -> bot.copy(y = max(bot.y - 1, 0))
+        Direction.DOWN -> bot.copy(y = min(bot.y + 1, settings.height - 1))
+    }
+    println("Bot after moving is is $newBot")
+    return Pair(state.copy(bots = state.bots - bot.id + (newBot.id to newBot)), newBot).right()
+}
+
+fun noop(bot: Bot, paramValue: String, state: State): Either<PaintBotsException, Pair<State, Bot>> {
+    return Pair(state, bot).right()
+}
+
+fun setBotColor(bot: Bot, paramValue: String, state: State): BotCommandReturn {
+    val color = paramValue[0]
+    return if (colors.keys.contains(color)) {
+        val newBot = bot.copy(color = paramValue[0])
+        Pair(state.copy(bots = state.bots - bot.id + (bot.id to newBot)), bot).right()
+    } else {
+        InvalidParameterException().left()
+    }
+}
+
+fun clear(bot: Bot, paramValue: String, state: State): BotCommandReturn {
+    state.canvas.setRGB(bot.x, bot.y, Color(0, 0, 0, 0).rgb)
+    return Pair(state, bot).right()
+}
+
+val commands = mapOf<String, ((Bot, String, State) -> BotCommandReturn)>(
+        "paint" to ::setPixel,
+        "bye" to ::removeBot,
+        "move" to ::moveBot,
+        "info" to ::noop,
+        "color" to ::setBotColor,
+        "clear" to ::clear,
+        "bye" to ::deregisterBot,
 )
 
 fun routeByParam(ctx: RoutingContext) {
-    ctx.request().formAttributes().firstNotNullOfOrNull { formKv ->
-        commands[formKv.key]
-    }?.invoke(ctx) ?: ctx.response().setStatusCode(400).end("Unknown command ${ctx.request().formAttributes()}")
+    ctx.request().formAttributes()["register"]?.let {
+        register(ctx).fold({
+            ctx.response().setStatusCode(400).end(it.toString())
+        }, { (_, bot) ->
+            ctx.response().setStatusCode(200).end(bot.id.toString())
+        })
+    } ?: ctx.request().formAttributes().firstNotNullOfOrNull { formKv ->
+        commands[formKv.key]?.let {
+            println("Command ${formKv.key}")
+            return@let botCommand(ctx, formKv.value, it)
+        }
+    } ?: ctx.response().setStatusCode(400).end("Unknown command ${ctx.request().formAttributes()}")
 }
 
 fun router(vertx: Vertx): Router {
     val router = Router.router(vertx)
-    router.post("/")
-        .handler(BodyHandler.create().setMergeFormAttributes(true))
-        .handler(::routeByParam)
+    router.post("/").handler(BodyHandler.create().setMergeFormAttributes(true)).handler(::routeByParam)
+    router.get("/").handler {
+        it.redirect("/index.html")
+    }
+    router.route("/*").handler(StaticHandler.create("frontend/build/distributions"));
     return router
 }
 
 fun main() {
-    val vertx = Vertx.vertx()
+    val canvas = state.get().canvas
+    (0 until canvas.width).forEach { x ->
+        (0 until canvas.height).forEach { y ->
+            canvas.setRGB(x, y, Color.LIGHT_GRAY.rgb)
+        }
+    }
     val options = HttpServerOptions().setPort(31173)
     vertx.createHttpServer(options)
-        .requestHandler(router(vertx))
-        .listen()
+            .requestHandler(router(vertx))
+            .webSocketHandler { ws ->
+                val id = UUID.randomUUID().toString()
+                val waitingInQueue = AtomicBoolean(false)
+
+                vertx.sharedData().getLock(id).onSuccess { lock ->
+                    val os = ByteArrayOutputStream()
+                    ImageIO.write(state.get().canvas, "png", os)
+                    ws.writeBinaryMessage(Buffer.buffer(os.toByteArray()))
+                    os.close()
+                    vertx.setTimer(100) {
+                        lock.release()
+                    }
+                }
+
+                val c = vertx.eventBus().localConsumer<State>("state") {
+                    if (!waitingInQueue.compareAndSet(expected = false, new = true)) {
+                        return@localConsumer // Someone else will send
+                    }
+                    vertx.sharedData().getLock(id).onSuccess { lock ->
+                        val os = ByteArrayOutputStream()
+                        ImageIO.write(state.get().canvas, "png", os)
+                        ws.writeBinaryMessage(Buffer.buffer(os.toByteArray()))
+                        println("Image sent")
+                        os.close()
+                        waitingInQueue.set(false)
+                        vertx.setTimer(100) {
+                            lock.release()
+                        }
+                    }
+                }
+                ws.closeHandler {
+                    c.unregister()
+                }
+            }
+            .listen {
+                if (it.succeeded()) {
+                    println("Server ready")
+                }
+            }
 }
